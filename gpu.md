@@ -63,6 +63,26 @@ r = requests.get("https://console.vast.ai/api/v0/templates/", params={"api_key":
 
 **Known issue**: The default PyTorch image bundles torchvision which can conflict with transformer-lens/SAELens. After instance boots, run `pip uninstall -y torchvision` to fix.
 
+## CRITICAL: prioritize network bandwidth over GPU price
+
+**The cheapest offer is often a false economy.** Slow upstream networks turn a "$0.085/hr" host into 30+ minutes of model-download wall time before any work happens. A Gemma 3 4B IT model is ~9 GB; 12B is ~24 GB. Qwen3-8B is ~16 GB. At 200 Mbps (the old default floor) a 9 GB download is ~6 min in the best case and often 15–30 min in practice when shared bandwidth is contended.
+
+**Default minimum requirements** (use these in every search):
+- `inet_down >= 1000` Mbps (Mbit/s, NOT MB/s — most decent hosts publish ≥1 Gbps)
+- `disk_bw >= 1000` MB/s (modern NVMe)
+- `reliability2 >= 0.99` (not 0.95 — flaky hosts waste more time than they save)
+
+**Common failure modes seen in the wild:**
+- Host advertises 200 Mbps, in practice transfers HF blobs at ~5 MB/s. Two `.incomplete` files stuck at the same byte count for 30+ seconds = network is broken on this host. Kill the instance and look for >1000 Mbps.
+- A 2080 Ti at $0.085/hr that sits 15 min on "Fetching 2 files: 0%" is **costing you more in real time than a $0.30/hr A40 with a fast pipe**. Time matters more than $/hr for most research workflows.
+- The vast.ai `inet_down` field is self-reported by the host. Treat it as a soft prior. If the actual download rate is <50% of advertised after the first minute, abandon the host.
+
+**Tiebreaker order when picking offers**:
+1. `inet_down` (single biggest factor for time-to-first-result)
+2. `compute_cap >= 800` (Ampere or newer; flash-attention support)
+3. `dph_total` (cheapest)
+4. `disk_bw`
+
 ## Commands
 
 ### `/gpu search [profile]`
@@ -80,31 +100,41 @@ query = {
     "rentable": {"eq": True},
     "num_gpus": {"eq": 1},
     "gpu_ram": {"gte": vram * 1024},  # API uses MiB
-    "cuda_vers": {"gte": 12.0},
+    "cuda_max_good": {"gte": 12.4},
+    "compute_cap": {"gte": 800},      # Ampere or newer (sm_80+)
     "direct_port_count": {"gte": 1},
-    "reliability2": {"gte": 0.95},
+    "reliability2": {"gte": 0.99},
+    "inet_down": {"gte": 1000},       # Mbps. CRITICAL — see notes above.
+    "disk_bw": {"gte": 1000},         # MB/s. NVMe-class.
+    "order": [["dph_total", "asc"]],
+    "limit": 10,
+    "type": "on-demand",
 }
 r = requests.get(
     "https://console.vast.ai/api/v0/bundles/",
-    params={"q": json.dumps(query), "order": "dph_total", "limit": 10,
-            "type": "on-demand", "api_key": API_KEY},
+    params={"q": json.dumps(query), "api_key": API_KEY},
 )
 offers = r.json().get("offers", [])
-# Show table: ID, GPU name, VRAM (GB), $/hr, reliability
+# Show table: ID, GPU name, VRAM (GB), inet_down, disk_bw, $/hr, reliability
 for o in offers:
-    print(f"{o['id']:>8d}  {o['gpu_name']:>25s}  {o['gpu_ram']/1024:.0f}GB  "
-          f"${o['dph_total']:.3f}/hr  rel={o.get('reliability2',0):.2f}")
+    print(f"{o['id']:>8d}  {o['gpu_name']:>22s}  {o['gpu_ram']/1024:.0f}GB  "
+          f"net{o.get('inet_down',0):.0f}Mbps  disk{o.get('disk_bw',0):.0f}MB/s  "
+          f"${o['dph_total']:.3f}/hr  rel={o.get('reliability2',0):.3f}")
 ```
 
 ### `/gpu launch [profile]`
-Find the cheapest matching offer and create an instance. Then poll until running.
+Find a fast-network matching offer and create an instance. Then poll until running.
+
+**Use the same query as `/gpu search`** (with the `inet_down >= 500`,
+`disk_bw >= 1000`, `compute_cap >= 800`, `reliability2 >= 0.99` defaults).
+Pick the cheapest *that meets these floors*, not the cheapest absolutely.
 
 ```python
 # Create instance
 payload = {
     "client_id": "me",
     "image": "pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel",
-    "disk": 20,
+    "disk": 25,
     "ssh": True,
     "direct": True,
 }
@@ -129,6 +159,12 @@ for _ in range(30):
         break
     time.sleep(10)
 ```
+
+**Health check after first download starts**: if a HuggingFace `du -sh`
+on the cache directory shows the same byte count after 30 seconds of
+elapsed time, the host's network is broken. Destroy the instance and pick
+a different offer. Two `.incomplete` files frozen at the same size = clear
+signal to abandon.
 
 After launch, proceed to setup automatically unless the user says otherwise.
 
